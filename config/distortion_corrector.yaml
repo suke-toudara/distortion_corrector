@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    # Base frame for transformation
+    base_frame: "base_link"
+
+    # Data source: "imu" or "odom"
+    use_data_source: "imu"
+
+    # Queue size in seconds
+    queue_size: 2.0
+
+    # Maximum number of messages in queue
+    max_queue_size: 200
