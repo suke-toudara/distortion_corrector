@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  distortion_corrector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: distortion_corrector
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=0
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - .:/root/ros2_ws/src/distortion_corrector:rw
+    command: ros2 launch distortion_corrector distortion_corrector.launch.py
+    stdin_open: true
+    tty: true
