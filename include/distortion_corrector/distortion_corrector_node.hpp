@@ -9,9 +9,12 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 
 namespace distortion_corrector
 {
@@ -35,6 +38,19 @@ private:
     const std::string & source_frame,
     const rclcpp::Time & time,
     geometry_msgs::msg::TransformStamped & transform);
+
+  // Pose interpolation from IMU/Odom data
+  bool interpolatePose(
+    const rclcpp::Time & target_time,
+    Eigen::Affine3d & pose);
+
+  bool interpolatePoseFromIMU(
+    const rclcpp::Time & target_time,
+    Eigen::Affine3d & pose);
+
+  bool interpolatePoseFromOdom(
+    const rclcpp::Time & target_time,
+    Eigen::Affine3d & pose);
 
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;

@@ -6,6 +6,23 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
+namespace
+{
+// Linear interpolation for translation
+Eigen::Vector3d lerpVector(
+  const Eigen::Vector3d & start, const Eigen::Vector3d & end, double ratio)
+{
+  return start + (end - start) * ratio;
+}
+
+// Spherical linear interpolation for rotation
+Eigen::Quaterniond slerpQuaternion(
+  const Eigen::Quaterniond & start, const Eigen::Quaterniond & end, double ratio)
+{
+  return start.slerp(ratio, end);
+}
+}  // namespace
+
 namespace distortion_corrector
 {
 
@@ -118,6 +135,166 @@ bool DistortionCorrectorNode::getTransform(
   }
 }
 
+bool DistortionCorrectorNode::interpolatePose(
+  const rclcpp::Time & target_time,
+  Eigen::Affine3d & pose)
+{
+  if (use_data_source_ == "imu") {
+    return interpolatePoseFromIMU(target_time, pose);
+  } else if (use_data_source_ == "odom") {
+    return interpolatePoseFromOdom(target_time, pose);
+  }
+  return false;
+}
+
+bool DistortionCorrectorNode::interpolatePoseFromIMU(
+  const rclcpp::Time & target_time,
+  Eigen::Affine3d & pose)
+{
+  if (imu_queue_.size() < 2) {
+    return false;
+  }
+
+  // Find two IMU messages surrounding the target time
+  sensor_msgs::msg::Imu::SharedPtr imu_before = nullptr;
+  sensor_msgs::msg::Imu::SharedPtr imu_after = nullptr;
+
+  for (size_t i = 0; i < imu_queue_.size() - 1; ++i) {
+    const auto t_current = rclcpp::Time(imu_queue_[i]->header.stamp);
+    const auto t_next = rclcpp::Time(imu_queue_[i + 1]->header.stamp);
+
+    if (t_current <= target_time && target_time <= t_next) {
+      imu_before = imu_queue_[i];
+      imu_after = imu_queue_[i + 1];
+      break;
+    }
+  }
+
+  // If exact match not found, use closest available
+  if (!imu_before || !imu_after) {
+    const auto closest = std::min_element(
+      imu_queue_.begin(), imu_queue_.end(),
+      [&target_time](const auto & a, const auto & b) {
+        return std::abs((rclcpp::Time(a->header.stamp) - target_time).seconds()) <
+               std::abs((rclcpp::Time(b->header.stamp) - target_time).seconds());
+      });
+
+    if (closest != imu_queue_.end()) {
+      const auto & imu = *closest;
+      Eigen::Quaterniond q(
+        imu->orientation.w, imu->orientation.x, imu->orientation.y, imu->orientation.z);
+      pose = Eigen::Affine3d::Identity();
+      pose.linear() = q.normalized().toRotationMatrix();
+      return true;
+    }
+    return false;
+  }
+
+  // Interpolate orientation
+  const double t_before = rclcpp::Time(imu_before->header.stamp).seconds();
+  const double t_after = rclcpp::Time(imu_after->header.stamp).seconds();
+  const double t_target = target_time.seconds();
+  const double ratio = (t_target - t_before) / (t_after - t_before);
+
+  Eigen::Quaterniond q_before(
+    imu_before->orientation.w, imu_before->orientation.x,
+    imu_before->orientation.y, imu_before->orientation.z);
+  Eigen::Quaterniond q_after(
+    imu_after->orientation.w, imu_after->orientation.x,
+    imu_after->orientation.y, imu_after->orientation.z);
+
+  // SLERP for smooth rotation interpolation
+  Eigen::Quaterniond q_interpolated = slerpQuaternion(q_before, q_after, ratio);
+
+  // IMU provides only orientation, no translation
+  pose = Eigen::Affine3d::Identity();
+  pose.linear() = q_interpolated.normalized().toRotationMatrix();
+
+  return true;
+}
+
+bool DistortionCorrectorNode::interpolatePoseFromOdom(
+  const rclcpp::Time & target_time,
+  Eigen::Affine3d & pose)
+{
+  if (odom_queue_.size() < 2) {
+    return false;
+  }
+
+  // Find two Odom messages surrounding the target time
+  nav_msgs::msg::Odometry::SharedPtr odom_before = nullptr;
+  nav_msgs::msg::Odometry::SharedPtr odom_after = nullptr;
+
+  for (size_t i = 0; i < odom_queue_.size() - 1; ++i) {
+    const auto t_current = rclcpp::Time(odom_queue_[i]->header.stamp);
+    const auto t_next = rclcpp::Time(odom_queue_[i + 1]->header.stamp);
+
+    if (t_current <= target_time && target_time <= t_next) {
+      odom_before = odom_queue_[i];
+      odom_after = odom_queue_[i + 1];
+      break;
+    }
+  }
+
+  // If exact match not found, use closest available
+  if (!odom_before || !odom_after) {
+    const auto closest = std::min_element(
+      odom_queue_.begin(), odom_queue_.end(),
+      [&target_time](const auto & a, const auto & b) {
+        return std::abs((rclcpp::Time(a->header.stamp) - target_time).seconds()) <
+               std::abs((rclcpp::Time(b->header.stamp) - target_time).seconds());
+      });
+
+    if (closest != odom_queue_.end()) {
+      const auto & odom = *closest;
+      Eigen::Vector3d trans(
+        odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z);
+      Eigen::Quaterniond q(
+        odom->pose.pose.orientation.w, odom->pose.pose.orientation.x,
+        odom->pose.pose.orientation.y, odom->pose.pose.orientation.z);
+
+      pose = Eigen::Affine3d::Identity();
+      pose.translation() = trans;
+      pose.linear() = q.normalized().toRotationMatrix();
+      return true;
+    }
+    return false;
+  }
+
+  // Interpolate pose
+  const double t_before = rclcpp::Time(odom_before->header.stamp).seconds();
+  const double t_after = rclcpp::Time(odom_after->header.stamp).seconds();
+  const double t_target = target_time.seconds();
+  const double ratio = (t_target - t_before) / (t_after - t_before);
+
+  // Interpolate translation (linear)
+  Eigen::Vector3d trans_before(
+    odom_before->pose.pose.position.x,
+    odom_before->pose.pose.position.y,
+    odom_before->pose.pose.position.z);
+  Eigen::Vector3d trans_after(
+    odom_after->pose.pose.position.x,
+    odom_after->pose.pose.position.y,
+    odom_after->pose.pose.position.z);
+  Eigen::Vector3d trans_interpolated = lerpVector(trans_before, trans_after, ratio);
+
+  // Interpolate rotation (SLERP)
+  Eigen::Quaterniond q_before(
+    odom_before->pose.pose.orientation.w, odom_before->pose.pose.orientation.x,
+    odom_before->pose.pose.orientation.y, odom_before->pose.pose.orientation.z);
+  Eigen::Quaterniond q_after(
+    odom_after->pose.pose.orientation.w, odom_after->pose.pose.orientation.x,
+    odom_after->pose.pose.orientation.y, odom_after->pose.pose.orientation.z);
+  Eigen::Quaterniond q_interpolated = slerpQuaternion(q_before, q_after, ratio);
+
+  // Compose pose
+  pose = Eigen::Affine3d::Identity();
+  pose.translation() = trans_interpolated;
+  pose.linear() = q_interpolated.normalized().toRotationMatrix();
+
+  return true;
+}
+
 bool DistortionCorrectorNode::undistortPointCloud(
   const sensor_msgs::msg::PointCloud2 & input,
   sensor_msgs::msg::PointCloud2 & output)
@@ -139,16 +316,19 @@ bool DistortionCorrectorNode::undistortPointCloud(
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::fromROSMsg(input, *cloud_in);
 
-  // Get reference transform (latest time)
+  // Reference time (scan end time)
   const rclcpp::Time ref_time = rclcpp::Time(input.header.stamp);
-  geometry_msgs::msg::TransformStamped ref_transform;
 
-  if (!getTransform(base_frame_, input.header.frame_id, ref_time, ref_transform)) {
+  // Get reference pose at scan end time
+  Eigen::Affine3d ref_pose;
+  if (!interpolatePose(ref_time, ref_pose)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                         "Failed to get reference pose");
     return false;
   }
 
-  // Calculate scan duration (assume uniform point distribution)
-  const double scan_duration = 0.1;  // 100ms typical for most LiDARs
+  // Calculate scan duration (100ms typical for most LiDARs)
+  const double scan_duration = 0.1;
   const size_t num_points = cloud_in->points.size();
 
   cloud_out->points.reserve(num_points);
@@ -164,26 +344,30 @@ bool DistortionCorrectorNode::undistortPointCloud(
       continue;
     }
 
-    // Calculate point timestamp (linear interpolation)
+    // Calculate point timestamp (linear interpolation from scan start to end)
     const double point_time_offset = (static_cast<double>(i) / num_points) * scan_duration;
     const rclcpp::Time point_time = ref_time - rclcpp::Duration::from_seconds(scan_duration - point_time_offset);
 
-    // Get transform for this point's time
-    geometry_msgs::msg::TransformStamped point_transform;
-    if (!getTransform(base_frame_, input.header.frame_id, point_time, point_transform)) {
+    // Get pose at this point's capture time
+    Eigen::Affine3d point_pose;
+    if (!interpolatePose(point_time, point_pose)) {
+      // If interpolation fails, keep original point
+      pcl::PointXYZI pt_out = pt_in;
+      cloud_out->points.push_back(pt_out);
       continue;
     }
 
-    // Convert point to Eigen
+    // Transform point:
+    // 1. Point is in sensor frame at point_time
+    // 2. Calculate relative transform from point_time to ref_time
+    // 3. Apply inverse transformation to "undo" the motion
+
     Eigen::Vector3d pt_eigen(pt_in.x, pt_in.y, pt_in.z);
 
-    // Apply point transform
-    Eigen::Affine3d point_affine = tf2::transformToEigen(point_transform);
-    Eigen::Vector3d pt_transformed = point_affine * pt_eigen;
-
-    // Apply inverse reference transform to bring back to sensor frame at reference time
-    Eigen::Affine3d ref_affine = tf2::transformToEigen(ref_transform);
-    Eigen::Vector3d pt_corrected = ref_affine.inverse() * pt_transformed;
+    // Relative transformation: from point capture time to reference time
+    // corrected_point = ref_pose^-1 * point_pose * original_point
+    Eigen::Affine3d relative_transform = ref_pose.inverse() * point_pose;
+    Eigen::Vector3d pt_corrected = relative_transform * pt_eigen;
 
     // Add corrected point
     pcl::PointXYZI pt_out;

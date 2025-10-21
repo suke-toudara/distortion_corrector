@@ -12,37 +12,75 @@ A ROS2 package for correcting point cloud distortion caused by robot/sensor moti
 
 ## 特徴 / Features
 
-- IMUまたはOdometryデータを使用した点群の歪み補正
-- TF2を使用した正確な座標変換
-- シンプルで理解しやすいコード構造
-- Docker環境での簡単な動作確認
-- 標準的なROS2メッセージ型のみを使用
+- **IMUまたはOdometryデータを使用した点群の歪み補正**
+  - ロボットの速度と回転による点群の歪みを正確に補正
+  - IMU: 回転のみを補正（角速度データから姿勢を補間）
+  - Odom: 位置と回転の両方を補正（位置・姿勢を線形/球面線形補間）
+- **SLERP（球面線形補間）による滑らかな回転補間**
+- **シンプルで理解しやすいコード構造**
+- **Docker環境での簡単な動作確認**
+- **標準的なROS2メッセージ型のみを使用**
 
 ---
 
-- Point cloud distortion correction using IMU or Odometry data
-- Accurate coordinate transformation using TF2
-- Simple and understandable code structure
-- Easy testing with Docker environment
-- Uses only standard ROS2 message types
+- **Point cloud distortion correction using IMU or Odometry data**
+  - Accurately corrects point cloud distortion caused by robot velocity and rotation
+  - IMU: Corrects rotation only (interpolates orientation from angular velocity data)
+  - Odom: Corrects both position and rotation (linear/spherical linear interpolation)
+- **Smooth rotation interpolation using SLERP (Spherical Linear Interpolation)**
+- **Simple and understandable code structure**
+- **Easy testing with Docker environment**
+- **Uses only standard ROS2 message types**
 
 ## 動作原理 / How It Works
 
 **日本語:**
 
-1. 点群データ、IMU/Odomデータを受信
-2. 各点のタイムスタンプを計算（点群内の位置から線形補間）
-3. 各点のタイムスタンプでのセンサー位置・姿勢をTF2から取得
-4. 各点を基準時刻の座標系に変換して歪みを補正
-5. 補正後の点群をパブリッシュ
+LiDARがスキャン中にロボットが移動・回転すると、点群に歪みが発生します。このパッケージは、IMU/Odometryデータを使用して、各点が取得された時刻での姿勢を推定し、すべての点を統一した時刻（スキャン終了時刻）の座標系に補正します。
+
+1. **点群データとIMU/Odomデータを受信**
+   - 点群データ（sensor_msgs/PointCloud2）
+   - IMUデータ（sensor_msgs/Imu）またはOdomデータ（nav_msgs/Odometry）
+
+2. **各点のタイムスタンプを計算**
+   - 点群内の位置から線形補間で各点の取得時刻を推定
+   - 例：点群が100msでスキャンされた場合、最初の点は0ms、最後の点は100ms
+
+3. **IMU/Odomデータから姿勢を補間**
+   - **IMUの場合**: 角速度データから回転を補間（SLERP）
+   - **Odomの場合**: 位置と姿勢を線形/球面線形補間
+
+4. **相対変換を計算して各点を補正**
+   - 基準時刻（スキャン終了時刻）の姿勢を取得
+   - 各点取得時刻の姿勢を取得
+   - 相対変換 = ref_pose^(-1) * point_pose
+   - 補正後の点 = 相対変換 * 元の点
+
+5. **補正後の点群をパブリッシュ**
 
 **English:**
 
-1. Receive point cloud and IMU/Odom data
-2. Calculate timestamp for each point (linear interpolation based on position in cloud)
-3. Get sensor pose at each point's timestamp from TF2
-4. Transform each point to reference frame to correct distortion
-5. Publish corrected point cloud
+When a robot moves or rotates during LiDAR scanning, point cloud distortion occurs. This package uses IMU/Odometry data to estimate the pose at the time each point was captured, and corrects all points to a unified coordinate frame at the reference time (scan end time).
+
+1. **Receive point cloud and IMU/Odom data**
+   - Point cloud data (sensor_msgs/PointCloud2)
+   - IMU data (sensor_msgs/Imu) or Odom data (nav_msgs/Odometry)
+
+2. **Calculate timestamp for each point**
+   - Estimate capture time of each point via linear interpolation based on position in cloud
+   - Example: If scan takes 100ms, first point at 0ms, last point at 100ms
+
+3. **Interpolate pose from IMU/Odom data**
+   - **IMU case**: Interpolate rotation from angular velocity data (SLERP)
+   - **Odom case**: Linear/spherical linear interpolation of position and orientation
+
+4. **Calculate relative transform and correct each point**
+   - Get pose at reference time (scan end time)
+   - Get pose at each point's capture time
+   - Relative transform = ref_pose^(-1) * point_pose
+   - Corrected point = relative transform * original point
+
+5. **Publish corrected point cloud**
 
 ## 必要要件 / Requirements
 
