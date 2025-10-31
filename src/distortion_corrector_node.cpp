@@ -3,43 +3,21 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <tf2_eigen/tf2_eigen.hpp>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-
-namespace
-{
-// Linear interpolation for translation
-Eigen::Vector3d lerpVector(
-  const Eigen::Vector3d & start, const Eigen::Vector3d & end, double ratio)
-{
-  return start + (end - start) * ratio;
-}
-
-// Spherical linear interpolation for rotation
-Eigen::Quaterniond slerpQuaternion(
-  const Eigen::Quaterniond & start, const Eigen::Quaterniond & end, double ratio)
-{
-  return start.slerp(ratio, end);
-}
-}  // namespace
 
 namespace distortion_corrector
 {
 
 DistortionCorrectorNode::DistortionCorrectorNode(const rclcpp::NodeOptions & options)
-: Node("distortion_corrector", options)
+: Node("distortion_corrector", options),
+  shutdown_(false)
 {
   // Parameters
-  base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
-  use_data_source_ = this->declare_parameter<std::string>("use_data_source", "imu");
-  queue_size_ = this->declare_parameter<double>("queue_size", 2.0);
-  max_queue_size_ = static_cast<size_t>(this->declare_parameter<int>("max_queue_size", 200));
+  scan_duration_ = this->declare_parameter<double>("scan_duration", 0.1);
+  max_buffer_size_ = static_cast<size_t>(this->declare_parameter<int>("max_buffer_size", 100));
+  use_imu_ = this->declare_parameter<bool>("use_imu", true);
+  use_odom_ = this->declare_parameter<bool>("use_odom", true);
 
-  // Initialize TF
-  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-  // Publishers
+  // Publisher
   pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
     "~/output/pointcloud", 10);
 
@@ -48,288 +26,264 @@ DistortionCorrectorNode::DistortionCorrectorNode(const rclcpp::NodeOptions & opt
     "~/input/pointcloud", 10,
     std::bind(&DistortionCorrectorNode::pointCloudCallback, this, std::placeholders::_1));
 
-  if (use_data_source_ == "imu") {
+  if (use_imu_) {
     imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
       "~/input/imu", 100,
       std::bind(&DistortionCorrectorNode::imuCallback, this, std::placeholders::_1));
-    RCLCPP_INFO(this->get_logger(), "Using IMU for distortion correction");
-  } else if (use_data_source_ == "odom") {
+    RCLCPP_INFO(this->get_logger(), "Using IMU for rotation correction");
+  }
+
+  if (use_odom_) {
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       "~/input/odom", 100,
       std::bind(&DistortionCorrectorNode::odomCallback, this, std::placeholders::_1));
-    RCLCPP_INFO(this->get_logger(), "Using Odometry for distortion correction");
-  } else {
-    RCLCPP_ERROR(this->get_logger(), "Invalid use_data_source: %s (must be 'imu' or 'odom')",
-                 use_data_source_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Using Odometry for translation correction");
   }
 
-  RCLCPP_INFO(this->get_logger(), "Distortion Corrector Node initialized");
+  // Start processing thread (Livox-style)
+  processing_thread_ = std::thread(&DistortionCorrectorNode::processingLoop, this);
+
+  RCLCPP_INFO(this->get_logger(), "Distortion Corrector Node initialized (Livox-style)");
+}
+
+DistortionCorrectorNode::~DistortionCorrectorNode()
+{
+  // Shutdown processing thread
+  {
+    std::lock_guard<std::mutex> lock(mtx_buffer_);
+    shutdown_ = true;
+  }
+  sig_buffer_.notify_all();
+
+  if (processing_thread_.joinable()) {
+    processing_thread_.join();
+  }
 }
 
 void DistortionCorrectorNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
 {
-  imu_queue_.push_back(msg);
+  std::lock_guard<std::mutex> lock(mtx_buffer_);
+
+  ImuData data;
+  data.time = rclcpp::Time(msg->header.stamp).seconds();
+  data.orientation = Eigen::Quaterniond(
+    msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
+  data.angular_velocity = Eigen::Vector3d(
+    msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
+
+  imu_buffer_.push_back(data);
 
   // Remove old data
-  const auto time_thresh = rclcpp::Time(msg->header.stamp) - rclcpp::Duration::from_seconds(queue_size_);
-  while (!imu_queue_.empty()) {
-    if (rclcpp::Time(imu_queue_.front()->header.stamp) < time_thresh) {
-      imu_queue_.pop_front();
-    } else {
-      break;
-    }
+  while (imu_buffer_.size() > max_buffer_size_) {
+    imu_buffer_.pop_front();
   }
 
-  // Limit queue size
-  while (imu_queue_.size() > max_queue_size_) {
-    imu_queue_.pop_front();
-  }
+  // Notify processing thread (Livox-style)
+  sig_buffer_.notify_all();
 }
 
 void DistortionCorrectorNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
-  odom_queue_.push_back(msg);
+  std::lock_guard<std::mutex> lock(mtx_buffer_);
+
+  OdomData data;
+  data.time = rclcpp::Time(msg->header.stamp).seconds();
+  data.position = Eigen::Vector3d(
+    msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
+  data.orientation = Eigen::Quaterniond(
+    msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
+    msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+
+  odom_buffer_.push_back(data);
 
   // Remove old data
-  const auto time_thresh = rclcpp::Time(msg->header.stamp) - rclcpp::Duration::from_seconds(queue_size_);
-  while (!odom_queue_.empty()) {
-    if (rclcpp::Time(odom_queue_.front()->header.stamp) < time_thresh) {
-      odom_queue_.pop_front();
-    } else {
+  while (odom_buffer_.size() > max_buffer_size_) {
+    odom_buffer_.pop_front();
+  }
+
+  // Notify processing thread (Livox-style)
+  sig_buffer_.notify_all();
+}
+
+void DistortionCorrectorNode::pointCloudCallback(
+  const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(mtx_buffer_);
+
+  cloud_buffer_.push_back(msg);
+
+  // Remove old data
+  while (cloud_buffer_.size() > 10) {
+    cloud_buffer_.pop_front();
+  }
+
+  // Notify processing thread (Livox-style)
+  sig_buffer_.notify_all();
+}
+
+void DistortionCorrectorNode::processingLoop()
+{
+  while (!shutdown_) {
+    std::unique_lock<std::mutex> lock(mtx_buffer_);
+
+    // Wait for data (Livox-style)
+    sig_buffer_.wait(lock, [this] {
+      return shutdown_ || !cloud_buffer_.empty();
+    });
+
+    if (shutdown_) {
+      break;
+    }
+
+    // Check if we have enough data
+    if (cloud_buffer_.empty()) {
+      continue;
+    }
+
+    // Check IMU/Odom availability
+    bool has_imu_data = use_imu_ && imu_buffer_.size() >= 2;
+    bool has_odom_data = use_odom_ && odom_buffer_.size() >= 2;
+
+    if ((use_imu_ && !has_imu_data) || (use_odom_ && !has_odom_data)) {
+      // Not enough sensor data yet
+      continue;
+    }
+
+    // Get oldest cloud
+    auto cloud_msg = cloud_buffer_.front();
+    cloud_buffer_.pop_front();
+
+    // Unlock before processing (Livox-style)
+    lock.unlock();
+
+    // Process point cloud
+    sensor_msgs::msg::PointCloud2 output;
+    if (correctDistortion(cloud_msg, output)) {
+      pointcloud_pub_->publish(output);
+    }
+  }
+}
+
+bool DistortionCorrectorNode::interpolateRotation(
+  double time, Eigen::Quaterniond & rotation)
+{
+  if (!use_imu_ || imu_buffer_.size() < 2) {
+    rotation = Eigen::Quaterniond::Identity();
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(mtx_buffer_);
+
+  // Find surrounding IMU data
+  ImuData before, after;
+  bool found = false;
+
+  for (size_t i = 0; i < imu_buffer_.size() - 1; ++i) {
+    if (imu_buffer_[i].time <= time && time <= imu_buffer_[i + 1].time) {
+      before = imu_buffer_[i];
+      after = imu_buffer_[i + 1];
+      found = true;
       break;
     }
   }
 
-  // Limit queue size
-  while (odom_queue_.size() > max_queue_size_) {
-    odom_queue_.pop_front();
-  }
-}
-
-void DistortionCorrectorNode::pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
-{
-  sensor_msgs::msg::PointCloud2 output;
-
-  if (undistortPointCloud(*msg, output)) {
-    pointcloud_pub_->publish(output);
-  } else {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Failed to undistort point cloud");
-  }
-}
-
-bool DistortionCorrectorNode::getTransform(
-  const std::string & target_frame,
-  const std::string & source_frame,
-  const rclcpp::Time & time,
-  geometry_msgs::msg::TransformStamped & transform)
-{
-  try {
-    transform = tf_buffer_->lookupTransform(
-      target_frame, source_frame, time, rclcpp::Duration::from_seconds(0.1));
-    return true;
-  } catch (tf2::TransformException & ex) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Could not transform: %s", ex.what());
-    return false;
-  }
-}
-
-bool DistortionCorrectorNode::interpolatePose(
-  const rclcpp::Time & target_time,
-  Eigen::Affine3d & pose)
-{
-  if (use_data_source_ == "imu") {
-    return interpolatePoseFromIMU(target_time, pose);
-  } else if (use_data_source_ == "odom") {
-    return interpolatePoseFromOdom(target_time, pose);
-  }
-  return false;
-}
-
-bool DistortionCorrectorNode::interpolatePoseFromIMU(
-  const rclcpp::Time & target_time,
-  Eigen::Affine3d & pose)
-{
-  if (imu_queue_.size() < 2) {
-    return false;
-  }
-
-  // Find two IMU messages surrounding the target time
-  sensor_msgs::msg::Imu::SharedPtr imu_before = nullptr;
-  sensor_msgs::msg::Imu::SharedPtr imu_after = nullptr;
-
-  for (size_t i = 0; i < imu_queue_.size() - 1; ++i) {
-    const auto t_current = rclcpp::Time(imu_queue_[i]->header.stamp);
-    const auto t_next = rclcpp::Time(imu_queue_[i + 1]->header.stamp);
-
-    if (t_current <= target_time && target_time <= t_next) {
-      imu_before = imu_queue_[i];
-      imu_after = imu_queue_[i + 1];
-      break;
-    }
-  }
-
-  // If exact match not found, use closest available
-  if (!imu_before || !imu_after) {
-    const auto closest = std::min_element(
-      imu_queue_.begin(), imu_queue_.end(),
-      [&target_time](const auto & a, const auto & b) {
-        return std::abs((rclcpp::Time(a->header.stamp) - target_time).seconds()) <
-               std::abs((rclcpp::Time(b->header.stamp) - target_time).seconds());
+  if (!found) {
+    // Use closest
+    auto closest = std::min_element(
+      imu_buffer_.begin(), imu_buffer_.end(),
+      [time](const ImuData & a, const ImuData & b) {
+        return std::abs(a.time - time) < std::abs(b.time - time);
       });
 
-    if (closest != imu_queue_.end()) {
-      const auto & imu = *closest;
-      Eigen::Quaterniond q(
-        imu->orientation.w, imu->orientation.x, imu->orientation.y, imu->orientation.z);
-      pose = Eigen::Affine3d::Identity();
-      pose.linear() = q.normalized().toRotationMatrix();
+    if (closest != imu_buffer_.end()) {
+      rotation = closest->orientation;
       return true;
     }
     return false;
   }
 
-  // Interpolate orientation
-  const double t_before = rclcpp::Time(imu_before->header.stamp).seconds();
-  const double t_after = rclcpp::Time(imu_after->header.stamp).seconds();
-  const double t_target = target_time.seconds();
-  const double ratio = (t_target - t_before) / (t_after - t_before);
-
-  Eigen::Quaterniond q_before(
-    imu_before->orientation.w, imu_before->orientation.x,
-    imu_before->orientation.y, imu_before->orientation.z);
-  Eigen::Quaterniond q_after(
-    imu_after->orientation.w, imu_after->orientation.x,
-    imu_after->orientation.y, imu_after->orientation.z);
-
-  // SLERP for smooth rotation interpolation
-  Eigen::Quaterniond q_interpolated = slerpQuaternion(q_before, q_after, ratio);
-
-  // IMU provides only orientation, no translation
-  pose = Eigen::Affine3d::Identity();
-  pose.linear() = q_interpolated.normalized().toRotationMatrix();
-
+  // SLERP interpolation
+  double ratio = (time - before.time) / (after.time - before.time);
+  rotation = before.orientation.slerp(ratio, after.orientation);
   return true;
 }
 
-bool DistortionCorrectorNode::interpolatePoseFromOdom(
-  const rclcpp::Time & target_time,
-  Eigen::Affine3d & pose)
+bool DistortionCorrectorNode::interpolateTranslation(
+  double time, Eigen::Vector3d & translation)
 {
-  if (odom_queue_.size() < 2) {
+  if (!use_odom_ || odom_buffer_.size() < 2) {
+    translation = Eigen::Vector3d::Zero();
     return false;
   }
 
-  // Find two Odom messages surrounding the target time
-  nav_msgs::msg::Odometry::SharedPtr odom_before = nullptr;
-  nav_msgs::msg::Odometry::SharedPtr odom_after = nullptr;
+  std::lock_guard<std::mutex> lock(mtx_buffer_);
 
-  for (size_t i = 0; i < odom_queue_.size() - 1; ++i) {
-    const auto t_current = rclcpp::Time(odom_queue_[i]->header.stamp);
-    const auto t_next = rclcpp::Time(odom_queue_[i + 1]->header.stamp);
+  // Find surrounding Odom data
+  OdomData before, after;
+  bool found = false;
 
-    if (t_current <= target_time && target_time <= t_next) {
-      odom_before = odom_queue_[i];
-      odom_after = odom_queue_[i + 1];
+  for (size_t i = 0; i < odom_buffer_.size() - 1; ++i) {
+    if (odom_buffer_[i].time <= time && time <= odom_buffer_[i + 1].time) {
+      before = odom_buffer_[i];
+      after = odom_buffer_[i + 1];
+      found = true;
       break;
     }
   }
 
-  // If exact match not found, use closest available
-  if (!odom_before || !odom_after) {
-    const auto closest = std::min_element(
-      odom_queue_.begin(), odom_queue_.end(),
-      [&target_time](const auto & a, const auto & b) {
-        return std::abs((rclcpp::Time(a->header.stamp) - target_time).seconds()) <
-               std::abs((rclcpp::Time(b->header.stamp) - target_time).seconds());
+  if (!found) {
+    // Use closest
+    auto closest = std::min_element(
+      odom_buffer_.begin(), odom_buffer_.end(),
+      [time](const OdomData & a, const OdomData & b) {
+        return std::abs(a.time - time) < std::abs(b.time - time);
       });
 
-    if (closest != odom_queue_.end()) {
-      const auto & odom = *closest;
-      Eigen::Vector3d trans(
-        odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z);
-      Eigen::Quaterniond q(
-        odom->pose.pose.orientation.w, odom->pose.pose.orientation.x,
-        odom->pose.pose.orientation.y, odom->pose.pose.orientation.z);
-
-      pose = Eigen::Affine3d::Identity();
-      pose.translation() = trans;
-      pose.linear() = q.normalized().toRotationMatrix();
+    if (closest != odom_buffer_.end()) {
+      translation = closest->position;
       return true;
     }
     return false;
   }
 
-  // Interpolate pose
-  const double t_before = rclcpp::Time(odom_before->header.stamp).seconds();
-  const double t_after = rclcpp::Time(odom_after->header.stamp).seconds();
-  const double t_target = target_time.seconds();
-  const double ratio = (t_target - t_before) / (t_after - t_before);
-
-  // Interpolate translation (linear)
-  Eigen::Vector3d trans_before(
-    odom_before->pose.pose.position.x,
-    odom_before->pose.pose.position.y,
-    odom_before->pose.pose.position.z);
-  Eigen::Vector3d trans_after(
-    odom_after->pose.pose.position.x,
-    odom_after->pose.pose.position.y,
-    odom_after->pose.pose.position.z);
-  Eigen::Vector3d trans_interpolated = lerpVector(trans_before, trans_after, ratio);
-
-  // Interpolate rotation (SLERP)
-  Eigen::Quaterniond q_before(
-    odom_before->pose.pose.orientation.w, odom_before->pose.pose.orientation.x,
-    odom_before->pose.pose.orientation.y, odom_before->pose.pose.orientation.z);
-  Eigen::Quaterniond q_after(
-    odom_after->pose.pose.orientation.w, odom_after->pose.pose.orientation.x,
-    odom_after->pose.pose.orientation.y, odom_after->pose.pose.orientation.z);
-  Eigen::Quaterniond q_interpolated = slerpQuaternion(q_before, q_after, ratio);
-
-  // Compose pose
-  pose = Eigen::Affine3d::Identity();
-  pose.translation() = trans_interpolated;
-  pose.linear() = q_interpolated.normalized().toRotationMatrix();
-
+  // Linear interpolation
+  double ratio = (time - before.time) / (after.time - before.time);
+  translation = before.position + ratio * (after.position - before.position);
   return true;
 }
 
-bool DistortionCorrectorNode::undistortPointCloud(
-  const sensor_msgs::msg::PointCloud2 & input,
+bool DistortionCorrectorNode::correctDistortion(
+  const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
   sensor_msgs::msg::PointCloud2 & output)
 {
-  // Check if we have enough data
-  if (use_data_source_ == "imu" && imu_queue_.size() < 2) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Not enough IMU data for correction");
-    return false;
-  }
-  if (use_data_source_ == "odom" && odom_queue_.size() < 2) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Not enough Odom data for correction");
-    return false;
-  }
-
   // Convert to PCL
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
-  pcl::fromROSMsg(input, *cloud_in);
+  pcl::fromROSMsg(*cloud_msg, *cloud_in);
 
-  // Reference time (scan end time)
-  const rclcpp::Time ref_time = rclcpp::Time(input.header.stamp);
+  const double ref_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
+  const size_t num_points = cloud_in->points.size();
 
-  // Get reference pose at scan end time
-  Eigen::Affine3d ref_pose;
-  if (!interpolatePose(ref_time, ref_pose)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Failed to get reference pose");
+  if (num_points == 0) {
+    RCLCPP_WARN(this->get_logger(), "Empty point cloud received");
     return false;
   }
 
-  // Calculate scan duration (100ms typical for most LiDARs)
-  const double scan_duration = 0.1;
-  const size_t num_points = cloud_in->points.size();
+  // Get reference pose (at scan end time)
+  Eigen::Quaterniond ref_rotation;
+  Eigen::Vector3d ref_translation;
+
+  if (!interpolateRotation(ref_time, ref_rotation)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                         "Failed to get reference rotation");
+    if (use_imu_) return false;
+  }
+
+  if (!interpolateTranslation(ref_time, ref_translation)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                         "Failed to get reference translation");
+    if (use_odom_) return false;
+  }
 
   cloud_out->points.reserve(num_points);
   cloud_out->header = cloud_in->header;
@@ -344,30 +298,31 @@ bool DistortionCorrectorNode::undistortPointCloud(
       continue;
     }
 
-    // Calculate point timestamp (linear interpolation from scan start to end)
-    const double point_time_offset = (static_cast<double>(i) / num_points) * scan_duration;
-    const rclcpp::Time point_time = ref_time - rclcpp::Duration::from_seconds(scan_duration - point_time_offset);
+    // Calculate point capture time (linear interpolation)
+    const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
+    const double point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
 
-    // Get pose at this point's capture time
-    Eigen::Affine3d point_pose;
-    if (!interpolatePose(point_time, point_pose)) {
-      // If interpolation fails, keep original point
-      pcl::PointXYZI pt_out = pt_in;
-      cloud_out->points.push_back(pt_out);
-      continue;
+    // Get pose at point capture time
+    Eigen::Quaterniond point_rotation;
+    Eigen::Vector3d point_translation;
+
+    if (!interpolateRotation(point_time, point_rotation)) {
+      point_rotation = ref_rotation;
     }
 
-    // Transform point:
-    // 1. Point is in sensor frame at point_time
-    // 2. Calculate relative transform from point_time to ref_time
-    // 3. Apply inverse transformation to "undo" the motion
+    if (!interpolateTranslation(point_time, point_translation)) {
+      point_translation = ref_translation;
+    }
 
-    Eigen::Vector3d pt_eigen(pt_in.x, pt_in.y, pt_in.z);
+    // Point in sensor frame
+    Eigen::Vector3d pt(pt_in.x, pt_in.y, pt_in.z);
 
-    // Relative transformation: from point capture time to reference time
-    // corrected_point = ref_pose^-1 * point_pose * original_point
-    Eigen::Affine3d relative_transform = ref_pose.inverse() * point_pose;
-    Eigen::Vector3d pt_corrected = relative_transform * pt_eigen;
+    // Correction: remove motion between point time and reference time
+    // Step 1: Transform to world frame at point time
+    Eigen::Vector3d pt_world = point_rotation * pt + point_translation;
+
+    // Step 2: Transform back to sensor frame at reference time
+    Eigen::Vector3d pt_corrected = ref_rotation.inverse() * (pt_world - ref_translation);
 
     // Add corrected point
     pcl::PointXYZI pt_out;
@@ -380,7 +335,7 @@ bool DistortionCorrectorNode::undistortPointCloud(
 
   // Convert back to ROS message
   pcl::toROSMsg(*cloud_out, output);
-  output.header = input.header;
+  output.header = cloud_msg->header;
 
   return true;
 }

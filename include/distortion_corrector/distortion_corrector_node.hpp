@@ -4,53 +4,57 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 namespace distortion_corrector
 {
 
+struct ImuData
+{
+  double time;
+  Eigen::Quaterniond orientation;
+  Eigen::Vector3d angular_velocity;
+};
+
+struct OdomData
+{
+  double time;
+  Eigen::Vector3d position;
+  Eigen::Quaterniond orientation;
+};
+
 class DistortionCorrectorNode : public rclcpp::Node
 {
 public:
   explicit DistortionCorrectorNode(const rclcpp::NodeOptions & options);
+  ~DistortionCorrectorNode();
 
 private:
+  // Callback functions
   void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
 
-  bool undistortPointCloud(
-    const sensor_msgs::msg::PointCloud2 & input,
+  // Processing thread
+  void processingLoop();
+
+  // Distortion correction
+  bool correctDistortion(
+    const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
     sensor_msgs::msg::PointCloud2 & output);
 
-  bool getTransform(
-    const std::string & target_frame,
-    const std::string & source_frame,
-    const rclcpp::Time & time,
-    geometry_msgs::msg::TransformStamped & transform);
-
-  // Pose interpolation from IMU/Odom data
-  bool interpolatePose(
-    const rclcpp::Time & target_time,
-    Eigen::Affine3d & pose);
-
-  bool interpolatePoseFromIMU(
-    const rclcpp::Time & target_time,
-    Eigen::Affine3d & pose);
-
-  bool interpolatePoseFromOdom(
-    const rclcpp::Time & target_time,
-    Eigen::Affine3d & pose);
+  // Interpolation functions
+  bool interpolateRotation(double time, Eigen::Quaterniond & rotation);
+  bool interpolateTranslation(double time, Eigen::Vector3d & translation);
 
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
@@ -60,19 +64,22 @@ private:
   // Publisher
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
 
-  // TF
-  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  // Data buffers
+  std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> cloud_buffer_;
+  std::deque<ImuData> imu_buffer_;
+  std::deque<OdomData> odom_buffer_;
 
-  // IMU/Odom data queue
-  std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_queue_;
-  std::deque<nav_msgs::msg::Odometry::SharedPtr> odom_queue_;
+  // Synchronization
+  std::mutex mtx_buffer_;
+  std::condition_variable sig_buffer_;
+  std::thread processing_thread_;
+  bool shutdown_;
 
   // Parameters
-  std::string base_frame_;
-  std::string use_data_source_;  // "imu" or "odom"
-  double queue_size_;
-  size_t max_queue_size_;
+  double scan_duration_;
+  size_t max_buffer_size_;
+  bool use_imu_;
+  bool use_odom_;
 };
 
 }  // namespace distortion_corrector

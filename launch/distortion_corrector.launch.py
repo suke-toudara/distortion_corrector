@@ -10,16 +10,22 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('distortion_corrector')
 
     # Declare arguments
-    use_data_source_arg = DeclareLaunchArgument(
-        'use_data_source',
-        default_value='imu',
-        description='Data source for correction: imu or odom'
+    use_imu_arg = DeclareLaunchArgument(
+        'use_imu',
+        default_value='true',
+        description='Use IMU for rotation correction'
     )
 
-    base_frame_arg = DeclareLaunchArgument(
-        'base_frame',
-        default_value='base_link',
-        description='Base frame for transformation'
+    use_odom_arg = DeclareLaunchArgument(
+        'use_odom',
+        default_value='true',
+        description='Use Odometry for translation correction'
+    )
+
+    scan_duration_arg = DeclareLaunchArgument(
+        'scan_duration',
+        default_value='0.1',
+        description='LiDAR scan duration in seconds'
     )
 
     # Parameters
@@ -33,8 +39,9 @@ def generate_launch_description():
         parameters=[
             params_file,
             {
-                'use_data_source': LaunchConfiguration('use_data_source'),
-                'base_frame': LaunchConfiguration('base_frame'),
+                'use_imu': LaunchConfiguration('use_imu'),
+                'use_odom': LaunchConfiguration('use_odom'),
+                'scan_duration': LaunchConfiguration('scan_duration'),
             }
         ],
         remappings=[
@@ -47,7 +54,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        use_data_source_arg,
-        base_frame_arg,
+        use_imu_arg,
+        use_odom_arg,
+        scan_duration_arg,
         distortion_corrector_node,
     ])
