@@ -1,13 +1,13 @@
 /**:
   ros__parameters:
-    # Base frame for transformation
-    base_frame: "base_link"
+    # Scan duration in seconds (typical values: 0.1 for most LiDARs)
+    scan_duration: 0.1
 
-    # Data source: "imu" or "odom"
-    use_data_source: "imu"
+    # Maximum buffer size for IMU/Odom data
+    max_buffer_size: 100
 
-    # Queue size in seconds
-    queue_size: 2.0
+    # Enable/disable IMU for rotation correction
+    use_imu: true
 
-    # Maximum number of messages in queue
-    max_queue_size: 200
+    # Enable/disable Odometry for translation correction
+    use_odom: true
