@@ -78,7 +78,8 @@ void DistortionCorrectorNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr
     imu_buffer_.pop_front();
   }
 
-  // Notify processing thread (Livox-style)
+  // Livox-style: Notify processing thread that new IMU data arrived
+  // The processing thread is waiting in sig_buffer_.wait() and will be woken up
   sig_buffer_.notify_all();
 }
 
@@ -101,7 +102,8 @@ void DistortionCorrectorNode::odomCallback(const nav_msgs::msg::Odometry::Shared
     odom_buffer_.pop_front();
   }
 
-  // Notify processing thread (Livox-style)
+  // Livox-style: Notify processing thread that new Odom data arrived
+  // The processing thread is waiting in sig_buffer_.wait() and will be woken up
   sig_buffer_.notify_all();
 }
 
@@ -117,7 +119,9 @@ void DistortionCorrectorNode::pointCloudCallback(
     cloud_buffer_.pop_front();
   }
 
-  // Notify processing thread (Livox-style)
+  // Livox-style: Notify processing thread that new point cloud arrived
+  // This triggers the processing thread to wake up from sig_buffer_.wait()
+  // and process the point cloud with surrounding IMU/Odom data
   sig_buffer_.notify_all();
 }
 
@@ -126,7 +130,8 @@ void DistortionCorrectorNode::processingLoop()
   while (!shutdown_) {
     std::unique_lock<std::mutex> lock(mtx_buffer_);
 
-    // Wait for data (Livox-style)
+    // Livox-style: Wait until point cloud arrives
+    // sig_buffer_.wait() blocks until notify_all() is called in callbacks
     sig_buffer_.wait(lock, [this] {
       return shutdown_ || !cloud_buffer_.empty();
     });
@@ -140,23 +145,24 @@ void DistortionCorrectorNode::processingLoop()
       continue;
     }
 
-    // Check IMU/Odom availability
+    // Check IMU/Odom availability (need at least 2 for interpolation)
     bool has_imu_data = use_imu_ && imu_buffer_.size() >= 2;
     bool has_odom_data = use_odom_ && odom_buffer_.size() >= 2;
 
     if ((use_imu_ && !has_imu_data) || (use_odom_ && !has_odom_data)) {
-      // Not enough sensor data yet
+      // Not enough sensor data yet, keep waiting
       continue;
     }
 
-    // Get oldest cloud
+    // Get oldest cloud from buffer
     auto cloud_msg = cloud_buffer_.front();
     cloud_buffer_.pop_front();
 
-    // Unlock before processing (Livox-style)
+    // Livox-style: Unlock before processing to allow new data to arrive
+    // This prevents blocking callbacks while doing CPU-intensive correction
     lock.unlock();
 
-    // Process point cloud
+    // Process point cloud with surrounding IMU/Odom data
     sensor_msgs::msg::PointCloud2 output;
     if (correctDistortion(cloud_msg, output)) {
       pointcloud_pub_->publish(output);
@@ -256,6 +262,25 @@ bool DistortionCorrectorNode::correctDistortion(
   const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
   sensor_msgs::msg::PointCloud2 & output)
 {
+  // Check for timestamp field (Livox-style or per-point timestamp)
+  // Common field names: "time", "timestamp", "t", "time_offset"
+  int time_offset_field = -1;
+  for (size_t i = 0; i < cloud_msg->fields.size(); ++i) {
+    const auto & field = cloud_msg->fields[i];
+    if (field.name == "time" || field.name == "timestamp" ||
+        field.name == "t" || field.name == "time_offset") {
+      time_offset_field = static_cast<int>(i);
+      RCLCPP_INFO_ONCE(this->get_logger(),
+        "Using per-point timestamp field: %s", field.name.c_str());
+      break;
+    }
+  }
+
+  if (time_offset_field == -1) {
+    RCLCPP_INFO_ONCE(this->get_logger(),
+      "No per-point timestamp field found, using linear interpolation");
+  }
+
   // Convert to PCL
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
@@ -289,6 +314,10 @@ bool DistortionCorrectorNode::correctDistortion(
   cloud_out->header = cloud_in->header;
   cloud_out->is_dense = cloud_in->is_dense;
 
+  // Access raw point cloud data for timestamp field
+  const uint8_t * data_ptr = cloud_msg->data.data();
+  const uint32_t point_step = cloud_msg->point_step;
+
   // Process each point
   for (size_t i = 0; i < num_points; ++i) {
     const auto & pt_in = cloud_in->points[i];
@@ -298,11 +327,32 @@ bool DistortionCorrectorNode::correctDistortion(
       continue;
     }
 
-    // Calculate point capture time (linear interpolation)
-    const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
-    const double point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
+    // Get point capture time
+    double point_time;
 
-    // Get pose at point capture time
+    if (time_offset_field >= 0) {
+      // Use per-point timestamp field (Livox-style)
+      const auto & field = cloud_msg->fields[time_offset_field];
+      const uint8_t * point_data = data_ptr + i * point_step;
+      const uint8_t * field_data = point_data + field.offset;
+
+      // Read timestamp (assume float or double)
+      float time_offset = 0.0f;
+      if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
+        time_offset = *reinterpret_cast<const float*>(field_data);
+      } else if (field.datatype == sensor_msgs::msg::PointField::FLOAT64) {
+        time_offset = static_cast<float>(*reinterpret_cast<const double*>(field_data));
+      }
+
+      // Point time = header timestamp + time offset
+      point_time = ref_time + static_cast<double>(time_offset);
+    } else {
+      // Fallback: linear interpolation based on point index
+      const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
+      point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
+    }
+
+    // Get pose at point capture time by interpolating surrounding IMU/Odom data
     Eigen::Quaterniond point_rotation;
     Eigen::Vector3d point_translation;
 
