@@ -1,13 +1,6 @@
 /**:
   ros__parameters:
-    # Scan duration in seconds (typical values: 0.1 for most LiDARs)
     scan_duration: 0.1
-
-    # Maximum buffer size for IMU/Odom data
     max_buffer_size: 100
-
-    # Enable/disable IMU for rotation correction
     use_imu: true
-
-    # Enable/disable Odometry for translation correction
     use_odom: true

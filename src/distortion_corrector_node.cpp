@@ -3,6 +3,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <cstring>
 
 namespace distortion_corrector
 {
@@ -42,19 +43,15 @@ DistortionCorrectorNode::DistortionCorrectorNode(const rclcpp::NodeOptions & opt
 
   // Start processing thread (Livox-style)
   processing_thread_ = std::thread(&DistortionCorrectorNode::processingLoop, this);
-
-  RCLCPP_INFO(this->get_logger(), "Distortion Corrector Node initialized (Livox-style)");
 }
 
 DistortionCorrectorNode::~DistortionCorrectorNode()
 {
-  // Shutdown processing thread
   {
     std::lock_guard<std::mutex> lock(mtx_buffer_);
     shutdown_ = true;
   }
   sig_buffer_.notify_all();
-
   if (processing_thread_.joinable()) {
     processing_thread_.join();
   }
@@ -63,22 +60,17 @@ DistortionCorrectorNode::~DistortionCorrectorNode()
 void DistortionCorrectorNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mtx_buffer_);
-
   ImuData data;
   data.time = rclcpp::Time(msg->header.stamp).seconds();
   data.orientation = Eigen::Quaterniond(
     msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
   data.angular_velocity = Eigen::Vector3d(
     msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
-
   imu_buffer_.push_back(data);
 
-  // Remove old data
   while (imu_buffer_.size() > max_buffer_size_) {
     imu_buffer_.pop_front();
   }
-
-  // Notify processing thread (Livox-style)
   sig_buffer_.notify_all();
 }
 
@@ -96,12 +88,10 @@ void DistortionCorrectorNode::odomCallback(const nav_msgs::msg::Odometry::Shared
 
   odom_buffer_.push_back(data);
 
-  // Remove old data
   while (odom_buffer_.size() > max_buffer_size_) {
     odom_buffer_.pop_front();
   }
 
-  // Notify processing thread (Livox-style)
   sig_buffer_.notify_all();
 }
 
@@ -125,43 +115,127 @@ void DistortionCorrectorNode::processingLoop()
 {
   while (!shutdown_) {
     std::unique_lock<std::mutex> lock(mtx_buffer_);
-
-    // Wait for data (Livox-style)
     sig_buffer_.wait(lock, [this] {
       return shutdown_ || !cloud_buffer_.empty();
     });
 
-    if (shutdown_) {
-      break;
-    }
+    if (cloud_buffer_.empty()) continue;
 
-    // Check if we have enough data
-    if (cloud_buffer_.empty()) {
-      continue;
-    }
-
-    // Check IMU/Odom availability
     bool has_imu_data = use_imu_ && imu_buffer_.size() >= 2;
     bool has_odom_data = use_odom_ && odom_buffer_.size() >= 2;
 
-    if ((use_imu_ && !has_imu_data) || (use_odom_ && !has_odom_data)) {
-      // Not enough sensor data yet
-      continue;
-    }
+    if ((use_imu_ && !has_imu_data) || (use_odom_ && !has_odom_data)) continue;
 
-    // Get oldest cloud
     auto cloud_msg = cloud_buffer_.front();
-    cloud_buffer_.pop_front();
+    cloud_buffer_.clear();
 
-    // Unlock before processing (Livox-style)
     lock.unlock();
 
-    // Process point cloud
     sensor_msgs::msg::PointCloud2 output;
     if (correctDistortion(cloud_msg, output)) {
       pointcloud_pub_->publish(output);
     }
   }
+}
+
+
+
+bool DistortionCorrectorNode::correctDistortion(
+  const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
+  sensor_msgs::msg::PointCloud2 & output)
+{
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZI>);
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
+  pcl::fromROSMsg(*cloud_msg, *cloud_in);
+
+  const double ref_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
+
+  // Get reference pose (at scan end time)
+  Eigen::Quaterniond ref_rotation;
+  Eigen::Vector3d ref_translation;
+
+  if (!interpolateRotation(ref_time, ref_rotation)) {
+    if (use_imu_) return false;
+  }
+
+  if (!interpolateTranslation(ref_time, ref_translation)) {
+    if (use_odom_) return false;
+  }
+
+  const size_t num_points = cloud_in->points.size();
+  cloud_out->points.reserve(num_points);
+  cloud_out->header = cloud_in->header;
+  cloud_out->is_dense = cloud_in->is_dense;
+
+  // Check if timestamp field exists in the input point cloud
+  bool has_timestamp = false;
+  size_t timestamp_offset = 0;
+  for (const auto & field : cloud_msg->fields) {
+    if (field.name == "timestamp") {
+      has_timestamp = true;
+      timestamp_offset = field.offset;
+      break;
+    }
+  }
+
+  // Process each point
+  for (size_t i = 0; i < num_points; ++i) {
+    const auto & pt_in = cloud_in->points[i];
+
+    // Skip invalid points
+    if (!std::isfinite(pt_in.x) || !std::isfinite(pt_in.y) || !std::isfinite(pt_in.z)) {
+      continue;
+    }
+
+    double point_time;
+    if (has_timestamp) {
+      // Extract timestamp from the original ROS message raw data
+      const uint8_t* point_data = &cloud_msg->data[i * cloud_msg->point_step + timestamp_offset];
+      double timestamp_seconds;
+      
+      // Assume timestamp is stored as double (8 bytes)
+      std::memcpy(&timestamp_seconds, point_data, sizeof(double));
+      point_time = timestamp_seconds;
+    } else {
+      // Calculate time based on point index when no timestamp field is available
+      const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
+      point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
+    }
+
+    Eigen::Quaterniond point_rotation;
+    Eigen::Vector3d point_translation;
+
+    if (!interpolateRotation(point_time, point_rotation)) {
+      point_rotation = ref_rotation;
+    }
+
+    if (!interpolateTranslation(point_time, point_translation)) {
+      point_translation = ref_translation;
+    }
+
+    // Point in sensor frame
+    Eigen::Vector3d pt(pt_in.x, pt_in.y, pt_in.z);
+
+    // Correction: remove motion between point time and reference time
+    // Step 1: Transform to world frame at point time
+    Eigen::Vector3d pt_world = point_rotation * pt + point_translation;
+
+    // Step 2: Transform back to sensor frame at reference time
+    Eigen::Vector3d pt_corrected = ref_rotation.inverse() * (pt_world - ref_translation);
+
+    // Add corrected point
+    pcl::PointXYZI pt_out;
+    pt_out.x = static_cast<float>(pt_corrected.x());
+    pt_out.y = static_cast<float>(pt_corrected.y());
+    pt_out.z = static_cast<float>(pt_corrected.z());
+    pt_out.intensity = pt_in.intensity;
+    cloud_out->points.push_back(pt_out);
+  }
+
+  // Convert back to ROS message
+  pcl::toROSMsg(*cloud_out, output);
+  output.header = cloud_msg->header;
+  return true;
 }
 
 bool DistortionCorrectorNode::interpolateRotation(
@@ -178,6 +252,7 @@ bool DistortionCorrectorNode::interpolateRotation(
   ImuData before, after;
   bool found = false;
 
+  // 対象の点群の時刻に対して前後のIMUデータを探索
   for (size_t i = 0; i < imu_buffer_.size() - 1; ++i) {
     if (imu_buffer_[i].time <= time && time <= imu_buffer_[i + 1].time) {
       before = imu_buffer_[i];
@@ -207,6 +282,7 @@ bool DistortionCorrectorNode::interpolateRotation(
   rotation = before.orientation.slerp(ratio, after.orientation);
   return true;
 }
+
 
 bool DistortionCorrectorNode::interpolateTranslation(
   double time, Eigen::Vector3d & translation)
@@ -252,93 +328,6 @@ bool DistortionCorrectorNode::interpolateTranslation(
   return true;
 }
 
-bool DistortionCorrectorNode::correctDistortion(
-  const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
-  sensor_msgs::msg::PointCloud2 & output)
-{
-  // Convert to PCL
-  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in(new pcl::PointCloud<pcl::PointXYZI>);
-  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
-  pcl::fromROSMsg(*cloud_msg, *cloud_in);
-
-  const double ref_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
-  const size_t num_points = cloud_in->points.size();
-
-  if (num_points == 0) {
-    RCLCPP_WARN(this->get_logger(), "Empty point cloud received");
-    return false;
-  }
-
-  // Get reference pose (at scan end time)
-  Eigen::Quaterniond ref_rotation;
-  Eigen::Vector3d ref_translation;
-
-  if (!interpolateRotation(ref_time, ref_rotation)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Failed to get reference rotation");
-    if (use_imu_) return false;
-  }
-
-  if (!interpolateTranslation(ref_time, ref_translation)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                         "Failed to get reference translation");
-    if (use_odom_) return false;
-  }
-
-  cloud_out->points.reserve(num_points);
-  cloud_out->header = cloud_in->header;
-  cloud_out->is_dense = cloud_in->is_dense;
-
-  // Process each point
-  for (size_t i = 0; i < num_points; ++i) {
-    const auto & pt_in = cloud_in->points[i];
-
-    // Skip invalid points
-    if (!std::isfinite(pt_in.x) || !std::isfinite(pt_in.y) || !std::isfinite(pt_in.z)) {
-      continue;
-    }
-
-    // Calculate point capture time (linear interpolation)
-    const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
-    const double point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
-
-    // Get pose at point capture time
-    Eigen::Quaterniond point_rotation;
-    Eigen::Vector3d point_translation;
-
-    if (!interpolateRotation(point_time, point_rotation)) {
-      point_rotation = ref_rotation;
-    }
-
-    if (!interpolateTranslation(point_time, point_translation)) {
-      point_translation = ref_translation;
-    }
-
-    // Point in sensor frame
-    Eigen::Vector3d pt(pt_in.x, pt_in.y, pt_in.z);
-
-    // Correction: remove motion between point time and reference time
-    // Step 1: Transform to world frame at point time
-    Eigen::Vector3d pt_world = point_rotation * pt + point_translation;
-
-    // Step 2: Transform back to sensor frame at reference time
-    Eigen::Vector3d pt_corrected = ref_rotation.inverse() * (pt_world - ref_translation);
-
-    // Add corrected point
-    pcl::PointXYZI pt_out;
-    pt_out.x = static_cast<float>(pt_corrected.x());
-    pt_out.y = static_cast<float>(pt_corrected.y());
-    pt_out.z = static_cast<float>(pt_corrected.z());
-    pt_out.intensity = pt_in.intensity;
-    cloud_out->points.push_back(pt_out);
-  }
-
-  // Convert back to ROS message
-  pcl::toROSMsg(*cloud_out, output);
-  output.header = cloud_msg->header;
-
-  return true;
-}
 
 }  // namespace distortion_corrector
 
