@@ -13,7 +13,7 @@ DistortionCorrectorNode::DistortionCorrectorNode(const rclcpp::NodeOptions & opt
   shutdown_(false)
 {
   // Parameters
-  scan_duration_ = this->declare_parameter<double>("scan_duration", 0.1);
+  scan_duration_ = this->declare_parameter<double>("scan_duration", 0.1); // 10Hz
   max_buffer_size_ = static_cast<size_t>(this->declare_parameter<int>("max_buffer_size", 100));
   use_imu_ = this->declare_parameter<bool>("use_imu", true);
   use_odom_ = this->declare_parameter<bool>("use_odom", true);
@@ -150,18 +150,6 @@ bool DistortionCorrectorNode::correctDistortion(
 
   const double ref_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
 
-  // Get reference pose (at scan end time)
-  Eigen::Quaterniond ref_rotation;
-  Eigen::Vector3d ref_translation;
-
-  if (!interpolateRotation(ref_time, ref_rotation)) {
-    if (use_imu_) return false;
-  }
-
-  if (!interpolateTranslation(ref_time, ref_translation)) {
-    if (use_odom_) return false;
-  }
-
   const size_t num_points = cloud_in->points.size();
   cloud_out->points.reserve(num_points);
   cloud_out->header = cloud_in->header;
@@ -189,15 +177,11 @@ bool DistortionCorrectorNode::correctDistortion(
 
     double point_time;
     if (has_timestamp) {
-      // Extract timestamp from the original ROS message raw data
       const uint8_t* point_data = &cloud_msg->data[i * cloud_msg->point_step + timestamp_offset];
       double timestamp_seconds;
-      
-      // Assume timestamp is stored as double (8 bytes)
       std::memcpy(&timestamp_seconds, point_data, sizeof(double));
       point_time = timestamp_seconds;
     } else {
-      // Calculate time based on point index when no timestamp field is available
       const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
       point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
     }
@@ -213,17 +197,10 @@ bool DistortionCorrectorNode::correctDistortion(
       point_translation = ref_translation;
     }
 
-    // Point in sensor frame
     Eigen::Vector3d pt(pt_in.x, pt_in.y, pt_in.z);
-
-    // Correction: remove motion between point time and reference time
-    // Step 1: Transform to world frame at point time
     Eigen::Vector3d pt_world = point_rotation * pt + point_translation;
-
-    // Step 2: Transform back to sensor frame at reference time
     Eigen::Vector3d pt_corrected = ref_rotation.inverse() * (pt_world - ref_translation);
 
-    // Add corrected point
     pcl::PointXYZI pt_out;
     pt_out.x = static_cast<float>(pt_corrected.x());
     pt_out.y = static_cast<float>(pt_corrected.y());
@@ -232,7 +209,6 @@ bool DistortionCorrectorNode::correctDistortion(
     cloud_out->points.push_back(pt_out);
   }
 
-  // Convert back to ROS message
   pcl::toROSMsg(*cloud_out, output);
   output.header = cloud_msg->header;
   return true;
@@ -247,8 +223,6 @@ bool DistortionCorrectorNode::interpolateRotation(
   }
 
   std::lock_guard<std::mutex> lock(mtx_buffer_);
-
-  // Find surrounding IMU data
   ImuData before, after;
   bool found = false;
 
