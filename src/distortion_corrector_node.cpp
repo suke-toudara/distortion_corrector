@@ -79,7 +79,6 @@ void DistortionCorrectorNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr
   }
 
   // Livox-style: Notify processing thread that new IMU data arrived
-  // The processing thread is waiting in sig_buffer_.wait() and will be woken up
   sig_buffer_.notify_all();
 }
 
@@ -103,7 +102,6 @@ void DistortionCorrectorNode::odomCallback(const nav_msgs::msg::Odometry::Shared
   }
 
   // Livox-style: Notify processing thread that new Odom data arrived
-  // The processing thread is waiting in sig_buffer_.wait() and will be woken up
   sig_buffer_.notify_all();
 }
 
@@ -120,8 +118,7 @@ void DistortionCorrectorNode::pointCloudCallback(
   }
 
   // Livox-style: Notify processing thread that new point cloud arrived
-  // This triggers the processing thread to wake up from sig_buffer_.wait()
-  // and process the point cloud with surrounding IMU/Odom data
+  // This triggers processing with surrounding IMU/Odom data
   sig_buffer_.notify_all();
 }
 
@@ -131,7 +128,6 @@ void DistortionCorrectorNode::processingLoop()
     std::unique_lock<std::mutex> lock(mtx_buffer_);
 
     // Livox-style: Wait until point cloud arrives
-    // sig_buffer_.wait() blocks until notify_all() is called in callbacks
     sig_buffer_.wait(lock, [this] {
       return shutdown_ || !cloud_buffer_.empty();
     });
@@ -140,7 +136,6 @@ void DistortionCorrectorNode::processingLoop()
       break;
     }
 
-    // Check if we have enough data
     if (cloud_buffer_.empty()) {
       continue;
     }
@@ -158,8 +153,7 @@ void DistortionCorrectorNode::processingLoop()
     auto cloud_msg = cloud_buffer_.front();
     cloud_buffer_.pop_front();
 
-    // Livox-style: Unlock before processing to allow new data to arrive
-    // This prevents blocking callbacks while doing CPU-intensive correction
+    // Livox-style: Unlock before processing
     lock.unlock();
 
     // Process point cloud with surrounding IMU/Odom data
@@ -262,8 +256,7 @@ bool DistortionCorrectorNode::correctDistortion(
   const sensor_msgs::msg::PointCloud2::SharedPtr & cloud_msg,
   sensor_msgs::msg::PointCloud2 & output)
 {
-  // Check for timestamp field (Livox-style or per-point timestamp)
-  // Common field names: "time", "timestamp", "t", "time_offset"
+  // Check for timestamp field
   int time_offset_field = -1;
   for (size_t i = 0; i < cloud_msg->fields.size(); ++i) {
     const auto & field = cloud_msg->fields[i];
@@ -286,7 +279,7 @@ bool DistortionCorrectorNode::correctDistortion(
   pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_out(new pcl::PointCloud<pcl::PointXYZI>);
   pcl::fromROSMsg(*cloud_msg, *cloud_in);
 
-  const double ref_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
+  const double cloud_header_time = rclcpp::Time(cloud_msg->header.stamp).seconds();
   const size_t num_points = cloud_in->points.size();
 
   if (num_points == 0) {
@@ -294,7 +287,11 @@ bool DistortionCorrectorNode::correctDistortion(
     return false;
   }
 
-  // Get reference pose (at scan end time)
+  // Reference time: scan START time (first point)
+  // Correction approach: "Subtract the movement from the first point"
+  const double ref_time = cloud_header_time - scan_duration_;
+
+  // Get reference pose at scan start time
   Eigen::Quaterniond ref_rotation;
   Eigen::Vector3d ref_translation;
 
@@ -302,12 +299,14 @@ bool DistortionCorrectorNode::correctDistortion(
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                          "Failed to get reference rotation");
     if (use_imu_) return false;
+    ref_rotation = Eigen::Quaterniond::Identity();
   }
 
   if (!interpolateTranslation(ref_time, ref_translation)) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                          "Failed to get reference translation");
     if (use_odom_) return false;
+    ref_translation = Eigen::Vector3d::Zero();
   }
 
   cloud_out->points.reserve(num_points);
@@ -331,12 +330,11 @@ bool DistortionCorrectorNode::correctDistortion(
     double point_time;
 
     if (time_offset_field >= 0) {
-      // Use per-point timestamp field (Livox-style)
+      // Use per-point timestamp field
       const auto & field = cloud_msg->fields[time_offset_field];
       const uint8_t * point_data = data_ptr + i * point_step;
       const uint8_t * field_data = point_data + field.offset;
 
-      // Read timestamp (assume float or double)
       float time_offset = 0.0f;
       if (field.datatype == sensor_msgs::msg::PointField::FLOAT32) {
         time_offset = *reinterpret_cast<const float*>(field_data);
@@ -344,35 +342,46 @@ bool DistortionCorrectorNode::correctDistortion(
         time_offset = static_cast<float>(*reinterpret_cast<const double*>(field_data));
       }
 
-      // Point time = header timestamp + time offset
-      point_time = ref_time + static_cast<double>(time_offset);
+      point_time = cloud_header_time + static_cast<double>(time_offset);
     } else {
-      // Fallback: linear interpolation based on point index
+      // Linear interpolation based on point index
       const double point_ratio = static_cast<double>(i) / static_cast<double>(num_points);
-      point_time = ref_time - scan_duration_ + point_ratio * scan_duration_;
+      point_time = ref_time + point_ratio * scan_duration_;
     }
 
-    // Get pose at point capture time by interpolating surrounding IMU/Odom data
+    // Get pose at this point's capture time
     Eigen::Quaterniond point_rotation;
     Eigen::Vector3d point_translation;
 
     if (!interpolateRotation(point_time, point_rotation)) {
-      point_rotation = ref_rotation;
+      // Interpolation failed - skip correction for this point
+      pcl::PointXYZI pt_out = pt_in;
+      cloud_out->points.push_back(pt_out);
+      continue;
     }
 
     if (!interpolateTranslation(point_time, point_translation)) {
-      point_translation = ref_translation;
+      // Interpolation failed - skip correction for this point
+      pcl::PointXYZI pt_out = pt_in;
+      cloud_out->points.push_back(pt_out);
+      continue;
     }
 
-    // Point in sensor frame
+    // === CORRECT APPROACH: Relative motion compensation ===
+    // Calculate "how much the sensor moved from ref_time to point_time"
+    // R_relative = ref_rotation^(-1) * point_rotation (relative rotation)
+    // T_relative = ref_rotation^(-1) * (point_translation - ref_translation) (relative translation in sensor frame)
+
+    Eigen::Quaterniond R_relative = ref_rotation.inverse() * point_rotation;
+    Eigen::Vector3d T_relative = ref_rotation.inverse() * (point_translation - ref_translation);
+
+    // Apply inverse of relative motion to bring point back to ref_time
+    // The point was observed at point_time (after moving by R_relative, T_relative)
+    // To get where it would be at ref_time, apply the inverse:
+    // pt_corrected = R_relative^(-1) * (pt - T_relative)
+
     Eigen::Vector3d pt(pt_in.x, pt_in.y, pt_in.z);
-
-    // Correction: remove motion between point time and reference time
-    // Step 1: Transform to world frame at point time
-    Eigen::Vector3d pt_world = point_rotation * pt + point_translation;
-
-    // Step 2: Transform back to sensor frame at reference time
-    Eigen::Vector3d pt_corrected = ref_rotation.inverse() * (pt_world - ref_translation);
+    Eigen::Vector3d pt_corrected = R_relative.inverse() * (pt - T_relative);
 
     // Add corrected point
     pcl::PointXYZI pt_out;
